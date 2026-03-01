@@ -1,0 +1,332 @@
+---
+title: "Analyzing Potential Predictors for Median House Value in Philadelphia"
+author: "Milan Brito"
+date: "2026-03-01"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+if(!require(pacman)){install.packages("pacman"); library(pacman)}
+p_load(tidyverse, tidycensus, tigris, sf, knitr, ggplot2, gridExtra, car, MASS, DAAG, spdep)
+options(scipen = 999)
+
+knitr::opts_chunk$set(echo = TRUE)
+census_api_key("fa0b0783ac6a60ef485a9ece582ff8102cc32f4c")
+```
+
+# The Problem
+
+We are using OLS regression analysis to identify any relationships between median house value and other neighborhood characteristics, such as educational attainment, vacancy rates, housing typology, median household income, poverty level, and median house value. The data we are using comes from the 2000 U.S. Census in Philadelphia, Pennsylvania.
+
+OLS regression has several assumptions, which are:
+1. Linear relationship between dependent variable and each of the independent variables
+2. Normality of residuals
+3. Homoscedasticity
+4. Independence of observations
+5. No multicollinearity
+6. No fewer than 10 observations per independent variable
+
+We will analyze our regression model to check if it follows these assumptions.
+
+## Data Cleaning
+We cleaned the original 1,816 observations to compile a new dataset with only 1,700 observations. The data cleaning process included removing block groups with less than 40 residents, blocks groups where there are no housing units, and block groups where the median house value is lower than $10,000. 
+
+*This satisfies OLS regression assumption #6.*
+
+```{r data_cleaning, message=FALSE}
+# Getting data from 2000 Census
+data_orig <- get_decennial(geography = "block group",
+                           state = "PA",
+                           county = "Philadelphia",
+                           variables = c("H076001", "P037015", "P037032",
+                                         "H002003", "H030002", "P089002",
+                                         "P053001", "P001001", "H001001"),
+                           year = 2000,
+                           output = "wide",
+                           geometry = TRUE,
+                           keep_geo_vars = TRUE,
+                           progress_bar = FALSE) %>% 
+  mutate(PCTBACHMOR = P037015 + P037032) %>% 
+  rename(MEDHVAL = H076001, PCTVACANT = H002003, PCTSINGLES = H030002,
+         NBELPOV100 = P089002, MEDHHINC = P053001, TOTPOP = P001001, 
+         TOTUNITS = H001001, NAME = NAME.y) %>% 
+  dplyr::select(GEOID, NAME, MEDHVAL, PCTBACHMOR, PCTVACANT, PCTSINGLES, 
+                    NBELPOV100, MEDHHINC, TOTPOP, TOTUNITS, geometry)
+
+# Cleaning data
+data_spatial <- data_orig %>% 
+  filter(TOTPOP >= 40) %>% 
+  filter(TOTUNITS > 0) %>% 
+  filter(MEDHVAL >= 10000)
+
+data <- as_tibble(data_spatial) %>% 
+  dplyr::select(!geometry)
+
+```
+
+# Exploratory Data Analysis
+
+Let's look at the summary statistics for each of the variables we identified: median house value (MEDHVAL), percentage of vacant houses (PCTVACANT), percentage of single house units (PCTSINGLES), percentage of individuals with bachelor’s degrees or higher (PCTBACHMOR), and number of households living in poverty (NBELPOV100).
+
+## Variable Distributions
+
+First, we'll visualize the distributions of each variable.
+
+```{r hist, echo=FALSE, message=FALSE}
+hist1 <- ggplot(data = data) +
+  geom_histogram(mapping = aes(MEDHVAL)) + 
+  labs(title = "Median House Value")
+
+hist2 <- ggplot(data = data) +
+  geom_histogram(mapping = aes(PCTBACHMOR)) + 
+  labs(title = "Percent with Bachelor's Degree or More")
+
+hist3 <- ggplot(data = data) +
+  geom_histogram(mapping = aes(NBELPOV100)) + 
+  labs(title = "Number of Households Living in Poverty")
+
+hist4 <- ggplot(data = data) +
+  geom_histogram(mapping = aes(PCTVACANT)) + 
+  labs(title = "Percent of Vacant Housing Units")
+
+hist5 <- ggplot(data = data) +
+  geom_histogram(mapping = aes(PCTSINGLES)) + 
+  labs(title = "Percent of Housing Units that are Detached Single Family Houses")
+
+grid.arrange(hist1, hist2, hist3, hist4, hist5, ncol = 2)
+```
+
+## Mean and Standard Deviation
+
+Now let's look at the mean and standard deviation of each variable.
+
+```{r mean, echo=FALSE}
+varmeans <- data[3:8] %>% 
+  summarise(across(everything(), mean))
+
+kable(varmeans, caption = "Variable Means")
+
+```
+
+```{r sd, echo=FALSE}
+varsd <- data[3:8] %>% 
+  summarise(across(everything(), sd))
+
+kable(varsd, caption = "Variable Standard Deviations")
+```
+
+## Logarithmic Transformations
+
+We'll explore applying a logarithmic transformation to variables. This is done to make the variables normally distributed to satisfy the assumptions of OLS regression. If any variable contained values equal to zero, then we add 1 before applying the logarithmic transformation. Any variable on which a log transformation was applied was designated by “LN” in front of the original variable name.
+
+```{r log}
+data <- data %>% 
+  mutate(LNMEDHVAL = log(MEDHVAL), LNPCTBACHMOR = log(1 + PCTBACHMOR),
+         LNNBELPOV100 = log(1 + NBELPOV100), LNPCTVACANT = log(1 + PCTVACANT),
+         LNPCTSINGLES = log(1 + PCTSINGLES))
+```
+
+Here are the distributions of each transformed variable.
+
+```{r loghist, echo=FALSE, message=FALSE}
+loghist1 <- ggplot(data = data) +
+  geom_histogram(mapping = aes(LNMEDHVAL)) + 
+  labs(title = "Log of Median House Value")
+
+loghist2 <- ggplot(data = data) +
+  geom_histogram(mapping = aes(LNPCTBACHMOR)) + 
+  labs(title = "Log of Percent with Bachelor's Degree or More")
+
+loghist3 <- ggplot(data = data) +
+  geom_histogram(mapping = aes(LNNBELPOV100)) + 
+  labs(title = "Log of Number of Households Living in Poverty")
+
+loghist4 <- ggplot(data = data) +
+  geom_histogram(mapping = aes(LNPCTVACANT)) + 
+  labs(title = "Log of Percent of Vacant Housing Units")
+
+loghist5 <- ggplot(data = data) +
+  geom_histogram(mapping = aes(LNPCTSINGLES)) + 
+  labs(title = "Log of Percent of Housing Units that are Detached Single Family Houses")
+
+grid.arrange(loghist1, loghist2, loghist3, loghist4, loghist5, ncol = 2)
+```
+
+We'll use the transformed variables for Median House Value (LNMEDHVAL) and Number of Households Living in Poverty (LNNBELPOV100). Since the other variables have zero-inflated distributions, we will use the untransformed versions (PCTBACHMOR, PCTVACANT, and PCTSINGLES).
+
+## Relationships Between Dependent and Independent Variables
+Let's see if the relationships between the dependent and independent variables are linear.
+
+```{r scatterplot, echo=FALSE}
+scatter1 <- ggplot(data = data, aes(x = PCTBACHMOR, y = LNMEDHVAL)) +
+  geom_point()
+
+scatter2 <- ggplot(data = data, aes(x = LNNBELPOV100, y = LNMEDHVAL)) +
+  geom_point()
+
+scatter3 <- ggplot(data = data, aes(x = PCTVACANT, y = LNMEDHVAL)) +
+  geom_point()
+
+scatter4 <- ggplot(data = data, aes(x = PCTSINGLES, y = LNMEDHVAL)) +
+  geom_point()
+
+grid.arrange(scatter1, scatter2, scatter3, scatter4, ncol = 2)
+```
+
+*None of these plots demonstrate a linear relationship, which violates OLS regression assumption #1.*
+
+## Checking for Multicollinearity
+
+We'll analyze the Pearson correlations between all the independent variables to ensure there's no multicollinearity.
+
+```{r pearson}
+pearson <- cor(data[,c(6,7,4,11)], method = "pearson")
+
+kable(pearson, caption = "Correlation Matrix for Independent Variables")
+```
+
+*The low Pearson correlation values indicate that there is no multicollinearity, satisfying OLS regression assumption #5.*
+
+## Spatial Analysis
+We'll use our `data_spatial` object to see these variables spatially. 
+
+```{r log_spatial}
+data_spatial <- data_spatial %>% 
+  mutate(LNMEDHVAL = log(MEDHVAL), LNPCTBACHMOR = log(1 + PCTBACHMOR),
+         LNNBELPOV100 = log(1 + NBELPOV100), LNPCTVACANT = log(1 + PCTVACANT),
+         LNPCTSINGLES = log(1 + PCTSINGLES))
+```
+
+Let's look at chloropleth maps of each variable.
+
+```{r maps, echo=FALSE}
+# LNMEDHVAL map
+plot1 <- ggplot(data = data_spatial) +
+  geom_sf(color = NA, aes(fill = LNMEDHVAL)) +
+  theme_void()
+
+# four predictor vars map
+plot2 <- ggplot(data = data_spatial) +
+  geom_sf(color = NA, aes(fill = PCTVACANT)) +
+  theme_void()
+
+plot3 <- ggplot(data = data_spatial) +
+  geom_sf(color = NA, aes(fill = PCTSINGLES)) +
+  theme_void()
+
+plot4 <- ggplot(data = data_spatial) +
+  geom_sf(color = NA, aes(fill = PCTBACHMOR)) +
+  theme_void()
+
+plot5 <- ggplot(data = data_spatial) +
+  geom_sf(color = NA, aes(fill = LNNBELPOV100)) +
+  theme_void()
+
+grid.arrange(plot1, plot2, plot3, plot4, plot5, ncol = 2)
+```
+
+# Regression Analysis
+
+We'll run a regression where LNMEDHVAL is the dependent variable and PCTVACANT, PCTSINGLES, PCTBACHMOR, and LNNBELPOV100 are the independent variables.
+
+```{r reg1}
+reg1 <- lm(LNMEDHVAL ~ PCTVACANT + PCTSINGLES + PCTBACHMOR + LNNBELPOV100,
+           data = data)
+```
+
+Let's look at the summary and ANOVA tables.
+
+```{r summary}
+summary(reg1)
+```
+
+```{r anova}
+anova(reg1)
+```
+
+## Results
+
+The regression output explains that all four of our independent variables are highly significant (p < 0.001 for all independent variables) and are associated with either an increase or decrease in LNBELOPOV100.
+
+## Residuals
+
+We'll save the fitted values, residuals, and standardized residuals to visualize our standardized residuals vs. predicted values.
+
+```{r resid}
+data <- data %>% 
+  mutate(predvals = fitted(reg1),
+         resids = residuals(reg1),
+         stdres = rstandard(reg1))
+```
+
+```{r reg_plot, echo=FALSE}
+ggplot(data = data) +
+  geom_point(mapping = aes(x = predvals, y = stdres, alpha = 0.6)) +
+  labs(title = "Residuals vs. Fitted", x = "Predicted Values", y = "Standardized Residuals") + 
+  geom_hline(yintercept = 0, color = "red") +
+  theme(legend.position = "none")
+```
+
+The residuals vs. fitted plot demonstrates that the variance of the residuals is constant and does not have any pattern. This means that our model exhibits homoscedasticity.
+
+*This satisfies OLS regression assumption #3.*
+
+Now, let's look at a histogram of our residuals.
+
+```{r resid_hist, echo=FALSE, message=FALSE}
+ggplot(data = data) +
+  geom_histogram(mapping = aes(resids)) + 
+  labs(title = "Residuals Histogram")
+```
+
+The residuals have a relatively normal distribution.
+
+*This satisfies OLS regression assumption #2.*
+
+## Checking for Spatial Dependencies
+We'll verify if the observations in our data are independent. First, let's look at a map of the residuals to see if there are patterns of over- or under-predicting. Blue areas indicate areas that we under-predicted, and red areas indicate areas that we over-predicted. 
+
+```{r spatial-resid, echo=FALSE}
+data_spatial <- data_spatial %>% 
+  mutate(predvals = fitted(reg1),
+         resids = residuals(reg1),
+         stdres = rstandard(reg1))
+
+ggplot(data = data_spatial) +
+  geom_sf(color = NA, aes(fill = stdres)) +
+  scale_fill_gradientn(colours = c("blue", "white", "red"),
+                      name = "Error") +
+  labs(fill = "",
+       title = "Spatial Distribution of Standardized Residuals") +
+  theme_void()
+```
+
+Another way of understanding spatial autocorrelation is through calculating Moran's I. Moran's I is within the range of -1 to 1, with -1 indicating negative correlation, 1 indicating positive correlation, and 0 indicating a random spatial pattern.
+
+```{r morans-i, message=FALSE, warning=FALSE}
+# Identifying neighbors
+coords <- st_coordinates(st_centroid(data_spatial))
+nb <- knn2nb(knearneigh(coords, k=5))
+weights <- nb2listw(nb, style="W")
+
+# Calculating Moran's I
+moran_test <- moran.mc(
+  data$resids,
+  weights,
+  nsim = 999)
+
+# Moran's I
+moran_test$statistic
+
+# p-value
+moran_test$p.value
+```
+
+The results of Moran's I indicate that there is significant clustering in our residuals, which means there is spatial autocorrelation present in our data and that observations are not independent of each other.
+
+*This violates OLS assumption #4.*
+
+
+# Discussion
+
+Although 2 out of 6 assumptions are violated, OLS regression is a helpful method for analyzing variable relationships. The high $R^2$ value of our model implies that the model is a good fit for the data.
